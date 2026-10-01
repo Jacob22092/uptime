@@ -1,0 +1,106 @@
+# Monitoring dostępności www.sortia.pl -> powiadomienia na Google Chat
+# Umieść ten plik w repozytorium jako: .github/workflows/uptime-sortia.yml
+# Wymagany sekret repozytorium: GOOGLE_CHAT_WEBHOOK (pełny adres webhooka Google Chat)
+
+name: Uptime sortia.pl
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # co 10 minut (GitHub potrafi opóźnić start o kilka minut)
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Wyślij testową wiadomość na Google Chat"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # zapis pliku ze stanem (żeby nie spamować przy każdym sprawdzeniu)
+
+concurrency:
+  group: uptime-sortia
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      URL: https://www.sortia.pl/
+      SITE: sortia.pl
+      WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+      STATE_FILE: status/sortia.txt
+      HEARTBEAT_FILE: status/heartbeat.txt
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sprawdź stronę i wyślij alert przy zmianie stanu
+        env:
+          TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::error::Brak sekretu GOOGLE_CHAT_WEBHOOK"; exit 1
+          fi
+
+          now_local() { TZ=Europe/Warsaw date '+%Y-%m-%d %H:%M'; }
+
+          send() {
+            jq -n --arg t "$1" '{text: $t}' \
+              | curl -sS --fail-with-body --max-time 20 -X POST \
+                  -H 'Content-Type: application/json; charset=UTF-8' \
+                  --data-binary @- "$WEBHOOK" > /dev/null
+          }
+
+          if [ "${TEST_ALERT}" = "true" ]; then
+            send "🧪 Test monitoringu ${SITE} – powiadomienia działają ($(now_local))"
+            echo "Wysłano wiadomość testową."
+          fi
+
+          # 3 próby co 20 s, żeby jednorazowe przycięcie nie dawało fałszywego alarmu
+          status=down; code=000
+          for i in 1 2 3; do
+            code=$(curl -sS -o /dev/null -L --max-time 20 \
+                     -A "UptimeCheck/1.0 (GitHub Actions)" \
+                     -w '%{http_code}' "$URL" 2>/dev/null || true)
+            code=${code:-000}
+            if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then status=up; break; fi
+            echo "Próba $i: kod $code"
+            [ "$i" -lt 3 ] && sleep 20
+          done
+          echo "Wynik: $status (kod $code)"
+
+          mkdir -p status
+          prev=up; since=$(date +%s)
+          if [ -f "$STATE_FILE" ]; then read -r prev since < "$STATE_FILE" || true; fi
+          prev=${prev:-up}; since=${since:-$(date +%s)}
+
+          changed=false
+          if [ "$status" != "$prev" ]; then
+            changed=true
+            if [ "$status" = "down" ]; then
+              send "🔴 ${SITE} nie działa (kod HTTP: ${code}) – $(now_local)
+          ${URL}"
+            else
+              mins=$(( ( $(date +%s) - since ) / 60 ))
+              send "🟢 ${SITE} znów działa (kod HTTP: ${code}) – $(now_local)
+          Przerwa trwała ok. ${mins} min."
+            fi
+            echo "$status $(date +%s)" > "$STATE_FILE"
+          fi
+
+          # GitHub wyłącza harmonogram po 60 dniach bez aktywności w repo – co ~50 dni robimy commit
+          last_commit=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last_commit )) -gt $(( 50 * 86400 )) ]; then
+            date -u '+%Y-%m-%dT%H:%M:%SZ' > "$HEARTBEAT_FILE"
+            changed=true
+          fi
+
+          if [ "$changed" = "true" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add status/
+            git commit -m "uptime: ${SITE} ${status}" > /dev/null
+            git push
+          fi
